@@ -7,7 +7,7 @@ Este repositório contém o deployment de uma aplicação Python utilizando o fr
 *   **Python 3.12+**
 *   **FastAPI** (Framework web)
 *   **Poetry** (Gestão de dependências e ambientes virtuais)
-*   **Docker** (Containerização)
+*   **Docker / Podman** (Containerização)
 *   **Docker Compose** (Orquestração de containers)
 
 ## 📁 Estrutura do Projeto
@@ -26,12 +26,12 @@ Abra o seu terminal e clone este repositório:
 
 git clone <https://github.com/Majandsss/Majandsss-ebac_docker.git>
 
-cd <LIVROS.EBAC>
+cd <Majandsss-ebac_docker>
 
 2. Construir e executar a aplicação
 Para criar a imagem da aplicação (instalando o Poetry e as dependências) e iniciar os contêineres em segundo plano, execute o comando abaixo na raiz do projeto:
 
-docker-compose up --build -d
+podman-compose up --build -d
 
 Nota: Com os volumes configurados, qualquer alteração feita no código-fonte local será sincronizada automaticamente com o contêiner (hot-reload).
 A aplicação poderá ser acessada no navegador através de http://localhost:8000 e a documentação interativa (Swagger) em http://localhost:8000/docs.
@@ -39,13 +39,4 @@ A aplicação poderá ser acessada no navegador através de http://localhost:800
 3. Parar a aplicação
 Para parar a execução e desligar os contêineres corretamente, utilize o seguinte comando:
 
-docker-compose down
-
-## 🛠️ Como Executar o Projeto
-
-Siga os passos abaixo para clonar e rodar a aplicação em sua máquina.
-
-### 1. Clonar o Repositório
-```bash
-git clone [https://github.com/Majandsss/Majandsss-ebac_docker.git](https://github.com/Majandsss/Majandsss-ebac_docker.git)
-cd Majandsss-ebac_docker.git
+podman-compose down
