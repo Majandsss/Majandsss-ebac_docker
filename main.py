@@ -40,9 +40,8 @@ def autenticar_meu_usuario(credentials: HTTPBasicCredentials = Depends(security)
             detail="Usuário ou senha incorretos",
             headers={"WWW-Authenticate": "Basic"}
         )
+    
     return credentials.username
-
-meus_livroz = {}
 
 class LivroDB(Base):
     __tablename__ = "Livros"
@@ -71,45 +70,61 @@ def hello_world():
     return {"Hello": "World!"}
 
 @app.get("/livros")
-def get_livros(page: int = 1, limit: int = 10, db: Session = Depends(sessao_db), usuario: str = Depends, credentials: HTTPBasicCredentials = Depends(autenticar_meu_usuario)):
+def get_livros(page: int = 1, limit: int = 10, db: Session = Depends(sessao_db), usuario: str = Depends(autenticar_meu_usuario)):
     if page < 1 or limit < 1:
         raise HTTPException(status_code=400, detail="Page or limit inválidos!")
     
     livros = db.query(LivroDB).offset((page - 1) * limit).limit(limit).all()
-
-    if not meus_livroz:
-        return {"message": "Não existe nenhum livro!", "livros": []}
-    
     total_livros = db.query(LivroDB).count()
+
+    if total_livros == 0:
+        return {"message": "Não existe nenhum livro!", "livros": []}
 
     return {
         "page": page,
         "limit": limit,
         "usuario_ativo": usuario,
         "total": total_livros,
-        "livros":[{"id": livro.id, "nome_livro": livro.nome-livro, "autor_livro": livro.autor_livro, "ano_livro": livro.ano_livro} for livro in livros]
+        "livros":[{"id": livro.id, "nome_livro": livro.nome_livro, "autor_livro": livro.autor_livro, "ano_livro": livro.ano_livro} for livro in livros]
     }
     
 @app.post("/adiciona")
-def post_livros(id_livro: int, livro: Livro, usuario: str = Depends(autenticar_meu_usuario)):
-    if id_livro in meus_livroz:
-        raise HTTPException(status_code=400, detail="Esse ID de livro já está cadastrado!")
-    else:
-        meus_livroz[id_livro] = livro.model_dump()
-        return {"message": f"Livro '{livro.nome_livro}' adicionado por {usuario}!"}
+def post_livros(livro: Livro, db: Session = Depends(sessao_db), usuario: str = Depends(autenticar_meu_usuario)):
+    novo_livro = LivroDB(
+        nome_livro=livro.nome_livro,
+        autor_livro=livro.autor_livro,
+        ano_livro=livro.ano_livro
+    )
+
+    db.add(novo_livro)
+    db.commit()
+    db.refresh(novo_livro)
+    
+    return {"message": f"Livro '{livro.nome_livro}' adicionado com o ID {novo_livro.id} por {usuario}!"}    
     
 @app.put("/atualiza/{id_livro}")
-def put_livros(id_livro: int, livro: Livro, usuario: str = Depends(autenticar_meu_usuario)):
-    if id_livro not in meus_livroz:
+def put_livros(id_livro: int, livro: Livro, db: Session = Depends(sessao_db), usuario: str = Depends(autenticar_meu_usuario)):
+    livro_db = db.query(LivroDB).filter(LivroDB.id == id_livro).first()
+    
+    if not livro_db:
         raise HTTPException(status_code=404, detail="Esse livro não foi encontrado!")
-    else:
-        meus_livroz[id_livro] = livro.model_dump()
-        return {"message": f"Livro atualizado com sucesso por {usuario}!"}
+    
+    livro_db.nome_livro = livro.nome_livro
+    livro_db.autor_livro = livro.autor_livro
+    livro_db.ano_livro = livro.ano_livro
+        
+    db.commit()
+
+    return {"message": f"Livro atualizado com sucesso por {usuario}!"}
 
 @app.delete("/deletar/{id_livro}")
-def delete_livro(id_livro: int, usuario: str = Depends(autenticar_meu_usuario)):
-    if id_livro not in meus_livroz:
+def delete_livro(id_livro: int, db: Session = Depends(sessao_db), usuario: str = Depends(autenticar_meu_usuario)):
+    livro_db = db.query(LivroDB).filter(LivroDB.id == id_livro).first()
+
+    if not livro_db:
         raise HTTPException(status_code=404, detail="Esse livro não foi encontrado!")
-    else:
-        del meus_livroz[id_livro]
-        return {"message": f"Livro deletado com sucesso por {usuario}!"}
+    
+    db.delete(livro_db)
+    db.commit()
+
+    return {"message": f"Livro deletado com sucesso por {usuario}!"}
