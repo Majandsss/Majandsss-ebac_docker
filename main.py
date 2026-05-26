@@ -7,6 +7,10 @@ import secrets
 import os
 import redis
 import json
+from fastapi import BackgroundTasks
+from tasks import fatorial, somar
+from celery_app import celery_app
+from celery.result import AsyncResult
 
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
@@ -18,7 +22,11 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+# Conexão com o Redis (reutilizável para toda a aplicação)
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = os.getenv("REDIS_PORT", "6379")
+
+redis_client = redis.Redis(host=REDIS_HOST, port=6379, db=0, decode_responses=True)
 
 app = FastAPI(
     title="API de Livros",
@@ -61,12 +69,6 @@ class Livro(BaseModel):
 
 Base.metadata.create_all(bind=engine)
 
-def salvar_livro_redis(livro_id: int, livro: Livro):
-    redis_client.set(f"livro:{livro_id}", json.dumps(livro.model_dump()))
-
-def deletar_livro_redis(livro_id: int):
-    redis_client.delete(f"livro:{livro_id}")
-
 def sessao_db():
     db = SessionLocal()
     try:
@@ -74,10 +76,83 @@ def sessao_db():
     finally:
         db.close()
 
+# --- MÉTODOS REDIS ---
+async def salvar_livros_redis(chave_cache: str, dados: dict):
+    """
+    Método assíncrono para salvar a lista de livros no Redis.
+    Utiliza um TTL (Time To Live) de 60 segundos.
+    """
+    # setex = set com expiration (expiração)
+    redis_client.setex(chave_cache, 60, json.dumps(dados))
+
+async def deletar_livro_redis():
+    """
+    Método assíncrono para remover as chaves correspondentes aos livros.
+    Limpa todos os caches de paginação para garantir a consistência.
+    """
+    # Encontra todas as chaves que começam com 'livros:' e as deleta
+    chaves = redis_client.keys("livros:*")
+    if chaves:
+        redis_client.delete(*chaves)
+
+# --- ENDPOINTS ---
 
 @app.get("/")
 def hello_world():
     return {"Hello": "World!"}
+
+@app.post("/calcular/soma")
+def calcular_soma(a: int, b: int):
+    print("🚨 [1] ROTA INICIADA!")
+    tarefa = somar.delay(a, b)
+
+    print(f"🚨 [2] TAREFA CRIADA COM ID: {tarefa.id}")
+
+    redis_client.lpush("tarefas_ids", tarefa.id)
+    redis_client.ltrim("tarefas_ids", 0, 49)
+
+    print("🚨 [3] SALVO NO REDIS COM SUCESSO!")
+
+    return {
+        "task_id": tarefa.id,
+        "message":"Tarefa de soma enviada para execução!"
+    }
+
+@app.post("/calcular/fatorial")
+def calcular_fatorial(n: int):
+    print(f"🚨 [FATORIAL] Rota iniciada para o número {n}!")
+    tarefa = fatorial.delay(n)
+    
+    # MUITA ATENÇÃO AO UNDERLINE AQUI:
+    redis_client.lpush("tarefas_ids", tarefa.id)
+    redis_client.ltrim("tarefas_ids", 0, 49)
+    
+    print(f"🚨 [FATORIAL] ID salvo no Redis: {tarefa.id}")
+    
+    return {
+        "task_id": tarefa.id,
+        "message": "Tarefa de fatorial enviada!"
+    }
+
+@app.get("/tarefas/recentes")
+def listar_tarefas_recentes():
+    ids = redis_client.lrange("tarefas_ids", 0, -1)
+
+    print(f"IDS encontrados no Redis: {ids}")
+    
+    tarefas = []
+
+    for task_id in ids:
+        resultado = AsyncResult(task_id, app=celery_app)
+        tarefas.append({
+            "task_id": task_id,
+            "status": resultado.status,
+            "resultado": resultado.result if resultado.successful() else None
+        })
+
+    return {
+        "tarefas": tarefas
+    }
 
 @app.get("/debug/redis")
 def ver_livros_redis():
@@ -87,13 +162,12 @@ def ver_livros_redis():
     for chave in chaves:
         valor = redis_client.get(chave)
         ttl = redis_client.ttl(chave)
-
         livros.append({"chave": chave, "valor": json.loads(valor), "ttl":ttl})
 
     return livros
 
 @app.get("/livros")
-def get_livros(
+async def get_livros(
     page: int = 1,
     limit: int = 10,
     db: Session = Depends(sessao_db),
@@ -102,12 +176,14 @@ def get_livros(
     if page < 1 or limit < 1:
         raise HTTPException(status_code=400, detail="Page or limit inválidos")
     
+    # 1. VERIFICA SE ESTÁ NO REDIS PRIMEIRO
     cache_key = f"livros:page={page}&limit={limit}"
     cached = redis_client.get(cache_key)
 
     if cached:
         return json.loads(cached)
     
+    # 2. SE NÃO ESTIVER, BUSCA NO BANCO DE DADOS
     livros = db.query(LivroDB).offset((page - 1) * limit).limit(limit).all()
 
     if not livros:
@@ -119,6 +195,7 @@ def get_livros(
         "page": page,
         "limit": limit,
         "total": total_livros,
+        "fonte": "Banco de Dados SQLite", # Para você debugar e ter certeza que veio do banco
         "livros": [
             {
                 "id": livro.id,
@@ -129,13 +206,13 @@ def get_livros(
         ]
     }
 
-    redis_client.setex(cache_key, 30, json.dumps(resposta))
+    # 3. SALVA O RESULTADO NO REDIS
+    await salvar_livros_redis(cache_key, resposta)
 
     return resposta
     
 @app.post("/adiciona")
 async def post_livros(livro: Livro, db: Session = Depends(sessao_db), usuario: str = Depends(autenticar_meu_usuario)):
-    # 💡 ADICIONADO O .first() NO FINAL DA CONSULTA
     db_livro = db.query(LivroDB).filter(
         LivroDB.nome_livro == livro.nome_livro, 
         LivroDB.autor_livro == livro.autor_livro, 
@@ -154,9 +231,9 @@ async def post_livros(livro: Livro, db: Session = Depends(sessao_db), usuario: s
     db.add(novo_livro)
     db.commit()
     db.refresh(novo_livro)
-    
-    # Salva no cache do Redis usando o ID gerado pelo banco
-    salvar_livro_redis(novo_livro.id, livro)
+
+# Invalida o cache porque um novo livro foi inserido (consistência)
+    await deletar_livro_redis()
 
     return {"message": f"Livro '{livro.nome_livro}' adicionado com o ID {novo_livro.id} por {usuario}!"}    
 
@@ -173,7 +250,8 @@ async def put_livros(id_livro: int, livro: Livro, db: Session = Depends(sessao_d
     db.commit()
     db.refresh(db_livro)
 
-    salvar_livro_redis(db_livro.id, livro)
+    # Invalida o cache porque os dados de um livro mudaram (consistência)
+    await deletar_livro_redis()
 
     return {"message": f"Livro atualizado com sucesso por {usuario}!"}
 
@@ -187,6 +265,7 @@ async def delete_livro(id_livro: int, db: Session = Depends(sessao_db), usuario:
     db.delete(db_livro)
     db.commit()
 
-    deletar_livro_redis(id_livro)
+    # Invalida o cache porque um livro foi removido (consistência)
+    await deletar_livro_redis()
 
     return {"message": f"Livro deletado com sucesso por {usuario}!"}
