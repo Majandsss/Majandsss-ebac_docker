@@ -26,6 +26,6 @@ jobs:
 
       - name: 📦 Instalar dependências com Poetry
         run: poetry install --no-interaction --no-root
-
-      - name: 🧪 Rodar testes (placeholder)
-        run: echo "Nenhum teste configurado ainda."
+        
+      - name: 🧪 Rodar testes
+        run: poetry run pytest -v
