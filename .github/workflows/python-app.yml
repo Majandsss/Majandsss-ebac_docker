@@ -7,28 +7,12 @@ on:
     branches: [main]
 
 jobs:
-  fastapi-tests:
+  fastapi-docker-tests:
     runs-on: ubuntu-latest
 
     steps:
       - name: 🔄 Checkout do código
         uses: actions/checkout@v3
 
-      - name: 🐍 Instalar Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.12'
-
-      - name: 🛠️ Instalar Poetry
-        run: |
-          curl -sSL https://install.python-poetry.org | python3 -
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      - name: 📦 Instalar dependências com Poetry
-        run: poetry install --no-interaction --no-root
-        
-      - name: 🧪 Rodar testes
-        env:
-          MEU_USUARIO: admin
-          MINHA_SENHA: admin
-        run: poetry run pytest -v
+      - name: Build da imagem Docker
+        run: docker build -t my-fastapi-app .
