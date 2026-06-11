@@ -1,8 +1,9 @@
-import asyncio
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import Optional
+import asyncio
 import secrets
 import os
 import redis
@@ -11,6 +12,7 @@ from fastapi import BackgroundTasks
 from tasks import fatorial, somar
 from celery_app import celery_app
 from celery.result import AsyncResult
+from kafka_producer import enviar_evento_kafka
 
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
@@ -23,10 +25,10 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # Conexão com o Redis (reutilizável para toda a aplicação)
-REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = os.getenv("REDIS_PORT", "6379")
 
-redis_client = redis.Redis(host=REDIS_HOST, port=6379, db=0, decode_responses=True)
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
 
 app = FastAPI(
     title="API de Livros",
@@ -38,9 +40,14 @@ app = FastAPI(
     }
 )
 
-MEU_USUARIO = os.getenv("MEU_USUARIO", "admin")
-MINHA_SENHA = os.getenv("MINHA_SENHA", "1234")
+load_dotenv()  # Carrega as variáveis de ambiente do arquivo .env
+
+MEU_USUARIO = os.getenv("MEU_USUARIO", "")
+MINHA_SENHA = os.getenv("MINHA_SENHA", "")
+
 security = HTTPBasic()
+
+meus_livroz = {}
 
 def autenticar_meu_usuario(credentials: HTTPBasicCredentials = Depends(security)):
     is_username_correct = secrets.compare_digest(credentials.username, MEU_USUARIO)
@@ -48,15 +55,15 @@ def autenticar_meu_usuario(credentials: HTTPBasicCredentials = Depends(security)
 
     if not (is_username_correct and is_password_correct):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Usuário ou senha incorretos",
+            status_code=401,
+            detail="Usuário não autorizado! Credenciais inválidas!",
             headers={"WWW-Authenticate": "Basic"}
         )
     
     return credentials.username
 
 class LivroDB(Base):
-    __tablename__ = "Livros"
+    __tablename__ = "livros"
     id = Column(Integer, primary_key=True, index=True)
     nome_livro = Column(String, index=True)
     autor_livro = Column(String, index=True)
@@ -77,23 +84,11 @@ def sessao_db():
         db.close()
 
 # --- MÉTODOS REDIS ---
-async def salvar_livros_redis(chave_cache: str, dados: dict):
-    """
-    Método assíncrono para salvar a lista de livros no Redis.
-    Utiliza um TTL (Time To Live) de 60 segundos.
-    """
-    # setex = set com expiration (expiração)
-    redis_client.setex(chave_cache, 60, json.dumps(dados))
+def salvar_livro_redis(livro_id: int, livro: Livro):
+    redis_client.set(f"livro:{livro_id}", json.dumps(livro.model_dump()))
 
-async def deletar_livro_redis():
-    """
-    Método assíncrono para remover as chaves correspondentes aos livros.
-    Limpa todos os caches de paginação para garantir a consistência.
-    """
-    # Encontra todas as chaves que começam com 'livros:' e as deleta
-    chaves = redis_client.keys("livros:*")
-    if chaves:
-        redis_client.delete(*chaves)
+def deletar_livro_redis(livro_id: int):
+    redis_client.delete(f"livro:{livro_id}")
 
 # --- ENDPOINTS ---
 
@@ -103,15 +98,9 @@ def hello_world():
 
 @app.post("/calcular/soma")
 def calcular_soma(a: int, b: int):
-    print("🚨 [1] ROTA INICIADA!")
-    tarefa = somar.delay(a, b)
-
-    print(f"🚨 [2] TAREFA CRIADA COM ID: {tarefa.id}")
-
-    redis_client.lpush("tarefas_ids", tarefa.id)
+    tarefa = somar.delay(a,b)
+    redis_client.lpush("tarefas.ids", tarefa.id)
     redis_client.ltrim("tarefas_ids", 0, 49)
-
-    print("🚨 [3] SALVO NO REDIS COM SUCESSO!")
 
     return {
         "task_id": tarefa.id,
@@ -120,26 +109,18 @@ def calcular_soma(a: int, b: int):
 
 @app.post("/calcular/fatorial")
 def calcular_fatorial(n: int):
-    print(f"🚨 [FATORIAL] Rota iniciada para o número {n}!")
     tarefa = fatorial.delay(n)
-    
-    # MUITA ATENÇÃO AO UNDERLINE AQUI:
-    redis_client.lpush("tarefas_ids", tarefa.id)
+    redis_client.lpush("tarefas.ids", tarefa.id)
     redis_client.ltrim("tarefas_ids", 0, 49)
-    
-    print(f"🚨 [FATORIAL] ID salvo no Redis: {tarefa.id}")
-    
+
     return {
         "task_id": tarefa.id,
-        "message": "Tarefa de fatorial enviada!"
+        "message":"Tarefa de fatorial enviada para execução!"
     }
 
 @app.get("/tarefas/recentes")
 def listar_tarefas_recentes():
     ids = redis_client.lrange("tarefas_ids", 0, -1)
-
-    print(f"IDS encontrados no Redis: {ids}")
-    
     tarefas = []
 
     for task_id in ids:
@@ -177,11 +158,11 @@ async def get_livros(
         raise HTTPException(status_code=400, detail="Page or limit inválidos")
     
     # 1. VERIFICA SE ESTÁ NO REDIS PRIMEIRO
-    cache_key = f"livros:page={page}&limit={limit}"
-    cached = redis_client.get(cache_key)
+    # cache_key = f"livros:page={page}&limit={limit}"
+    # cached = redis_client.get(cache_key)
 
-    if cached:
-        return json.loads(cached)
+    #if cached:
+    #    return json.loads(cached)
     
     # 2. SE NÃO ESTIVER, BUSCA NO BANCO DE DADOS
     livros = db.query(LivroDB).offset((page - 1) * limit).limit(limit).all()
@@ -195,7 +176,6 @@ async def get_livros(
         "page": page,
         "limit": limit,
         "total": total_livros,
-        "fonte": "Banco de Dados SQLite", # Para você debugar e ter certeza que veio do banco
         "livros": [
             {
                 "id": livro.id,
@@ -206,8 +186,7 @@ async def get_livros(
         ]
     }
 
-    # 3. SALVA O RESULTADO NO REDIS
-    await salvar_livros_redis(cache_key, resposta)
+    #redis_client.setex(cache_key, 30, json.dumps(resposta))
 
     return resposta
     
@@ -232,8 +211,12 @@ async def post_livros(livro: Livro, db: Session = Depends(sessao_db), usuario: s
     db.commit()
     db.refresh(novo_livro)
 
-# Invalida o cache porque um novo livro foi inserido (consistência)
-    await deletar_livro_redis()
+    salvar_livro_redis(novo_livro.id, livro)
+
+    enviar_evento_kafka("livros_eventos", {
+        "acao": "criar",
+        "livro": livro.model_dump()
+    })
 
     return {"message": f"Livro '{livro.nome_livro}' adicionado com o ID {novo_livro.id} por {usuario}!"}    
 
